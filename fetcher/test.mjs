@@ -120,6 +120,18 @@ async function main() {
     }
   }
 
+  // WordPress.com serves a 403 "Checking your browser..." interstitial to a
+  // user agent whose Chrome version disagrees with the Sec-CH-UA headers
+  // Chromium sends alongside it. Nothing else on the seed list notices.
+  console.log("\n=== bot check (user agent matches its own client hints)");
+  {
+    const d = await post("/discover", { url: "https://bluerenga.blog/" });
+    check("bluerenga discovers", d.ok !== false, d.error);
+    check("  not challenged", d.status === 200, `status ${d.status}: ${d.title}`);
+    check("  found a feed", (d.feeds || []).length > 0);
+    check("  found links", (d.links || []).length > 20, `${(d.links || []).length} links`);
+  }
+
   console.log("\n=== SSRF guard");
   for (const bad of [
     "http://127.0.0.1:4000/healthz",

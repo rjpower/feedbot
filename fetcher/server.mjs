@@ -24,11 +24,6 @@ const NAV_TIMEOUT_MS = Number(process.env.FETCHER_NAV_TIMEOUT_MS || 45_000);
 const SETTLE_TIMEOUT_MS = Number(process.env.FETCHER_SETTLE_TIMEOUT_MS || 5_000);
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
-const USER_AGENT =
-  process.env.FETCHER_USER_AGENT ||
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +
-    "Chrome/141.0.0.0 Safari/537.36 feedbot/1.0 (+https://feedbot.rjp.io)";
-
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // ---------------------------------------------------------------------------
@@ -131,11 +126,35 @@ async function getBrowser() {
   return browserPromise;
 }
 
+/**
+ * How we introduce ourselves. The version has to come from the browser we are
+ * actually driving: Chromium sends `Sec-CH-UA` headers that we do not control,
+ * so a hardcoded version silently rots the next time the base image moves, and
+ * a UA that disagrees with its own client hints reads as a spoof. WordPress.com
+ * answers that with a 403 "Checking your browser..." page.
+ */
+async function identity() {
+  const major = (await getBrowser()).version().split(".")[0];
+  return {
+    userAgent:
+      process.env.FETCHER_USER_AGENT ||
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+        `Chrome/${major}.0.0.0 Safari/537.36 feedbot/1.0 (+https://feedbot.rjp.io)`,
+    headers: {
+      "sec-ch-ua": `"Chromium";v="${major}", "Google Chrome";v="${major}", "Not)A;Brand";v="24"`,
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Linux"',
+    },
+  };
+}
+
 /** Run `fn(page)` in a throwaway context. Images/media/fonts never load. */
 async function withPage(fn) {
   const browser = await getBrowser();
+  const { userAgent, headers } = await identity();
   const context = await browser.newContext({
-    userAgent: USER_AGENT,
+    userAgent,
+    extraHTTPHeaders: headers,
     viewport: { width: 1280, height: 2000 },
     locale: "en-US",
     javaScriptEnabled: true,
@@ -450,11 +469,12 @@ function atomLink(entry) {
 }
 
 async function fetchFeedBody(target) {
+  const { userAgent } = await identity();
   // Plain fetch first — feeds are static XML and this avoids a browser tab.
   try {
     const res = await fetch(target.href, {
       headers: {
-        "user-agent": USER_AGENT,
+        "user-agent": userAgent,
         accept: "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
       },
       redirect: "follow",
