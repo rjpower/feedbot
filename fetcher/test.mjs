@@ -7,6 +7,12 @@
 
 const BASE = process.env.FETCHER_URL || "http://127.0.0.1:4000";
 
+const siteKey = (s) =>
+  (s || "")
+    .toLowerCase()
+    .replace(/^\s*the\s+/, "")
+    .replace(/[^a-z0-9]/g, "");
+
 let failures = 0;
 const check = (name, cond, detail = "") => {
   console.log(`${cond ? "  ok  " : "  FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
@@ -118,6 +124,47 @@ async function main() {
     } else {
       check("fetched both posts", false, two.map((x) => x.error).join("; "));
     }
+  }
+
+  // analog-antiquarian.net renders a listing card whose <h1> is the *series*
+  // name, so `article h1` gives every chapter the same title. Only the <title>
+  // distinguishes them.
+  console.log("\n=== post heading vs. listing-card heading");
+  {
+    const [a, b] = await Promise.all([
+      post("/article", { url: "https://analog-antiquarian.net/2025/12/12/chapter-9-a-late-bloomer/" }),
+      post("/article", { url: "https://analog-antiquarian.net/2026/03/13/chapter-15-the-trial-of-galileo/" }),
+    ]);
+    check("both chapters fetched", a.ok !== false && b.ok !== false, `${a.error || ""} ${b.error || ""}`);
+    check("  chapter 9 titled by chapter", /A Late Bloomer/i.test(a.title || ""), a.title);
+    check("  chapter 15 titled by chapter", /Trial of Galileo/i.test(b.title || ""), b.title);
+    check("  not the series title", a.title !== b.title);
+    check("  no site chrome", !/Analog Antiquarian/i.test(a.title || ""), a.title);
+    check("  keeps the chapter number", /^Chapter 9\b/.test(a.title || ""), a.title);
+  }
+
+  // The same precedence on Blogger, whose <title> carries the blog name as a
+  // "Blog: Post" prefix — a colon, which is not a chrome separator.
+  console.log("\n=== blogger keeps the post title, not the blog name");
+  {
+    const r = await post("/article", {
+      url: "https://crpgaddict.blogspot.com/2026/07/our-second-greatest-gift.html",
+    });
+    check("fetched", r.ok !== false, r.error);
+    check("  titled by post", /Second-Greatest Gift/i.test(r.title || ""), r.title);
+    check("  not the blog name", siteKey(r.title) !== "crpgaddict", r.title);
+    check("  no blog-name prefix", !/^The CRPG Addict:/i.test(r.title || ""), r.title);
+  }
+
+  // Blogger answers an unknown slug with 404 and eleven thousand characters of
+  // sidebar, which Readability will happily call an article.
+  console.log("\n=== a 404 is not an article");
+  {
+    const r = await post("/article", {
+      url: "https://crpgaddict.blogspot.com/2026/07/game-472-take-a-train.html",
+    });
+    check("refuses a 404 page", r.ok === false, r.error || `got title "${r.title}"`);
+    check("  says so", /404/.test(r.error || ""), r.error);
   }
 
   // WordPress.com serves a 403 "Checking your browser..." interstitial to a

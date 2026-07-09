@@ -230,12 +230,20 @@ async function article({ url }) {
     };
   });
 
+  // A "page not found" page is still a page: Blogger's is 11k characters of
+  // sidebar, plenty for Readability to hand back as an article. Believe the
+  // status code instead.
+  if (status >= 400) {
+    throw new HttpError(422, `${finalUrl} returned HTTP ${status}`);
+  }
+
   // Readability mutates the document it is handed, so give it a private one.
   // `url` makes it resolve relative <img src> and <a href> against the page.
   const dom = new JSDOM(html, { url: finalUrl });
   const doc = dom.window.document;
 
   const ogTitle = attrOf(doc, 'meta[property="og:title"]', "content");
+  const ogSiteName = attrOf(doc, 'meta[property="og:site_name"]', "content");
   const headingTitle = extractHeading(doc);
   const publishedTime = extractPublished(doc);
 
@@ -252,17 +260,26 @@ async function article({ url }) {
   }
   const content = unwrapReadability(parsed.content);
   const text = (parsed.textContent || "").replace(/\s+/g, " ").trim();
+  const siteName = parsed.siteName?.trim() || null;
+  const bareTitle = stripSiteChrome(pageTitle, finalUrl, siteName, ogSiteName);
   return {
     finalUrl,
     status,
-    // Readability's title often keeps the site's chrome ("» Post — The Blog"),
-    // because it falls back to <title> when the markup gives it nothing better.
-    // og:title is what the author told social networks to show; the post
-    // heading is the next most trustworthy. The caller may still override this
-    // with a feed title.
-    title: (ogTitle || headingTitle || parsed.title || pageTitle || "").trim(),
+    // og:title is what the author told social networks to show. Then the post
+    // heading, but only if the <title> vouches for it. Then the <title> with the
+    // blog's name stripped off — which beats a heading we could not corroborate,
+    // and is empty when the <title> is just the blog's name. The caller may
+    // still override all of this with a feed title.
+    title: (
+      ogTitle ||
+      corroboratedHeading(headingTitle, pageTitle) ||
+      bareTitle ||
+      headingTitle ||
+      pageTitle ||
+      ""
+    ).trim(),
     byline: parsed.byline?.trim() || null,
-    siteName: parsed.siteName?.trim() || null,
+    siteName,
     // NOT parsed.excerpt: that prefers the page's meta description, which on
     // Blogger is the *blog's* tagline — identical on every post it publishes.
     excerpt: excerptOf(content, text),
@@ -353,6 +370,63 @@ function extractHeading(doc) {
     if (t && t.length > 2 && t.length < 300) return t;
   }
   return null;
+}
+
+/** Compare titles the way a reader would: ignoring case, space and dashes. */
+const normalizeTitle = (s) =>
+  (s || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[“”"'’‘–—-]/g, "")
+    .trim();
+
+/**
+ * A heading we can believe. `article h1` matches the <h1> of *any* <article> on
+ * the page, and analog-antiquarian.net renders a listing card whose heading is
+ * the series name — so all thirteen chapters of one series came back with the
+ * same title. The <title> is the one per-post string themes reliably get right,
+ * so make it a witness: trust the heading only when the title agrees with it.
+ */
+function corroboratedHeading(heading, pageTitle) {
+  const [h, t] = [normalizeTitle(heading), normalizeTitle(pageTitle)];
+  return h && t && t.includes(h) ? heading : null;
+}
+
+/** "The Analog Antiquarian" and "analog-antiquarian" both reduce to one word. */
+const siteKey = (s) =>
+  (s || "")
+    .toLowerCase()
+    .replace(/^\s*the\s+/, "")
+    .replace(/[^a-z0-9]/g, "");
+
+/** " – ", " | ", " » ", " - " separate a title from its chrome. A colon does not. */
+const TITLE_SEPARATOR = /\s+[|»«–—·]+\s+|\s+-\s+/;
+
+/**
+ * The page title with the blog's own name taken off either end. Readability
+ * can't do this: given "Chapter 9: A Late Bloomer – The Analog Antiquarian" it
+ * splits on the colon and hands back "A Late Bloomer – The Analog Antiquarian".
+ *
+ * Returns "" when the title is nothing *but* the site's name, as Blogger's is
+ * ("The CRPG Addict") — that is a title telling us nothing, and the caller
+ * should prefer even an uncorroborated heading to it.
+ */
+function stripSiteChrome(pageTitle, finalUrl, parsedSiteName, ogSiteName) {
+  // The domain's own label names the site on blogs that never say so in markup.
+  let label = "";
+  try {
+    label = new URL(finalUrl).hostname.replace(/^www\./, "").split(".")[0];
+  } catch {
+    /* a title is not worth throwing over */
+  }
+  const aliases = new Set([parsedSiteName, ogSiteName, label].map(siteKey).filter(Boolean));
+  const parts = (pageTitle || "")
+    .split(TITLE_SEPARATOR)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  while (parts.length && aliases.has(siteKey(parts[parts.length - 1]))) parts.pop();
+  while (parts.length && aliases.has(siteKey(parts[0]))) parts.shift();
+  return parts.join(" – ");
 }
 
 const DATE_TEXT_SELECTORS = [

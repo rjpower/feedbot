@@ -80,7 +80,10 @@ check("most articles are dated", sum(1 for a in arts if a["published_at"]) >= 0.
 check("list omits content_html", all("content_html" not in a for a in arts))
 urls = [a["url"] for a in arts]
 check("no duplicate urls", len(set(urls)) == len(urls), f"{len(urls) - len(set(urls))} dupes")
-check("newest first", [a["published_at"] or 0 for a in arts] == sorted((a["published_at"] or 0 for a in arts), reverse=True))
+# An undated post sorts by when we fetched it, not to the bottom of the inbox
+# forever — so this is COALESCE(published_at, fetched_at), as the server orders.
+recency = [a["published_at"] or a["fetched_at"] for a in arts]
+check("newest first", recency == sorted(recency, reverse=True))
 
 one = call(f"/api/articles/{arts[0]['id']}?state=all")
 html = one["content_html"]
