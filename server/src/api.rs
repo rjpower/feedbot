@@ -1,6 +1,6 @@
 //! HTTP surface: a JSON API under `/api`, the Vue bundle everywhere else.
 
-use crate::crawl::Crawler;
+use crate::crawl::{CrawlOutcome, Crawler};
 use crate::db::{self, ArticleQuery, NewSite, Pool, SitePatch};
 use crate::{Config, epub};
 use axum::{
@@ -287,9 +287,22 @@ async fn crawl_now(
     {
         return Err(ApiError::not_found("no such site"));
     }
+    let busy = || {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "a crawl for this site is already running" })),
+        )
+            .into_response()
+    };
+
     if opts.wait {
-        let summary = st.crawler.crawl_site(id).await?;
-        return Ok(Json(summary).into_response());
+        return Ok(match st.crawler.crawl_site(id).await? {
+            CrawlOutcome::Ran(summary) => Json(summary).into_response(),
+            CrawlOutcome::AlreadyRunning => busy(),
+        });
+    }
+    if st.crawler.is_running(id) {
+        return Ok(busy());
     }
     let crawler = st.crawler.clone();
     tokio::spawn(async move {

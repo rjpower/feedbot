@@ -16,7 +16,7 @@ use crate::fetcher::Fetcher;
 use crate::urlx;
 use anyhow::{Context, Result};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -30,6 +30,7 @@ pub struct Crawler {
     /// One crawl at a time: there is one browser behind the sidecar, and we
     /// would rather be slow than be rude.
     permit: Arc<Semaphore>,
+    in_flight: InFlight,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -37,6 +38,53 @@ pub struct CrawlSummary {
     pub discovered: i64,
     pub added: i64,
     pub failed: i64,
+}
+
+#[derive(Debug)]
+pub enum CrawlOutcome {
+    Ran(CrawlSummary),
+    AlreadyRunning,
+}
+
+/// The set of sites that are crawling *or waiting to*.
+///
+/// `last_crawled_at` is only stamped when a crawl finishes, so a site queued
+/// behind the semaphore still looks due to the scheduler. Without this, a slow
+/// first crawl gets a redundant second one enqueued right behind it.
+#[derive(Clone, Default)]
+struct InFlight(Arc<std::sync::Mutex<HashSet<i64>>>);
+
+/// Releases the site when the crawl ends, however it ends.
+struct Claim {
+    set: InFlight,
+    id: i64,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.set
+            .0
+            .lock()
+            .expect("in-flight lock poisoned")
+            .remove(&self.id);
+    }
+}
+
+impl InFlight {
+    fn claim(&self, id: i64) -> Option<Claim> {
+        let mut set = self.0.lock().expect("in-flight lock poisoned");
+        set.insert(id).then(|| Claim {
+            set: self.clone(),
+            id,
+        })
+    }
+
+    fn contains(&self, id: i64) -> bool {
+        self.0
+            .lock()
+            .expect("in-flight lock poisoned")
+            .contains(&id)
+    }
 }
 
 /// One article we might want, before we know whether we already have it.
@@ -58,11 +106,23 @@ impl Crawler {
             fetcher,
             delay,
             permit: Arc::new(Semaphore::new(1)),
+            in_flight: InFlight::default(),
         }
     }
 
+    /// Is this site crawling, or queued to?
+    pub fn is_running(&self, site_id: i64) -> bool {
+        self.in_flight.contains(site_id)
+    }
+
     /// Crawl one site end to end, recording a `crawls` row either way.
-    pub async fn crawl_site(&self, site_id: i64) -> Result<CrawlSummary> {
+    pub async fn crawl_site(&self, site_id: i64) -> Result<CrawlOutcome> {
+        // Claim before waiting on the semaphore, so a site queued behind
+        // another site's crawl is already visible as in-flight.
+        let Some(_claim) = self.in_flight.claim(site_id) else {
+            tracing::info!(site_id, "crawl skipped: already running");
+            return Ok(CrawlOutcome::AlreadyRunning);
+        };
         let _guard = self.permit.acquire().await.expect("semaphore never closed");
 
         let site = db::call(&self.pool, move |c| db::get_site(c, site_id))
@@ -96,7 +156,7 @@ impl Crawler {
             None => {
                 tracing::info!(site = %site.name, discovered = summary.discovered,
                                added = summary.added, failed = summary.failed, "crawl done");
-                Ok(summary)
+                Ok(CrawlOutcome::Ran(summary))
             }
         }
     }
@@ -368,6 +428,10 @@ pub fn schedule(crawler: Arc<Crawler>, tick: Duration) {
                 }
             };
             for site in due {
+                // A site whose first crawl is still queued is due but busy.
+                if crawler.is_running(site.id) {
+                    continue;
+                }
                 if let Err(e) = crawler.crawl_site(site.id).await {
                     tracing::warn!(site = %site.name, "scheduled crawl failed: {e:#}");
                 }
@@ -456,6 +520,35 @@ mod tests {
             &base,
             None
         ));
+    }
+
+    #[test]
+    fn a_site_can_only_be_claimed_once_at_a_time() {
+        let f = InFlight::default();
+        let first = f.claim(7).expect("first claim succeeds");
+        assert!(f.contains(7));
+        assert!(f.claim(7).is_none(), "a second claim must be refused");
+        // ...but other sites are unaffected.
+        let other = f.claim(8).expect("a different site is free");
+        assert!(f.contains(8));
+
+        drop(first);
+        assert!(!f.contains(7), "dropping the claim releases the site");
+        assert!(f.claim(7).is_some(), "and it can be claimed again");
+        drop(other);
+        assert!(!f.contains(8));
+    }
+
+    /// A crawl that fails must not leave its site permanently unclaimable.
+    #[test]
+    fn a_claim_is_released_even_on_an_early_return() {
+        let f = InFlight::default();
+        fn fallible(f: &InFlight) -> Result<()> {
+            let _claim = f.claim(1).unwrap();
+            anyhow::bail!("boom");
+        }
+        assert!(fallible(&f).is_err());
+        assert!(!f.contains(1));
     }
 
     #[test]

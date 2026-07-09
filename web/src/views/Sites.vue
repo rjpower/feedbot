@@ -70,6 +70,7 @@ async function withBusy(id, fn) {
   }
 }
 
+// A 409 means the scheduler beat us to it — say so rather than looking broken.
 const crawlNow = (s) => withBusy(s.id, () => api.crawlSite(s.id));
 const toggleEnabled = (s) => withBusy(s.id, () => api.patchSite(s.id, { enabled: !s.enabled }));
 
