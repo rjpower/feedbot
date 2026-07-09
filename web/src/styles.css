@@ -1,0 +1,259 @@
+/* feedbot — a reading room.
+ *
+ * The look is a printed periodical index: warm paper, deep ink, hairline rules,
+ * and exactly one accent (an oxidized vermilion) reserved for things that are
+ * unread or actionable. No cards, no drop shadows, no purple gradients.
+ *
+ * Three themes, because that is what an e-reader owes you: paper, sepia, ink.
+ */
+
+@import "@fontsource-variable/fraunces/index.css";
+@import "@fontsource-variable/newsreader/index.css";
+@import "@fontsource/archivo-narrow/400.css";
+@import "@fontsource/archivo-narrow/600.css";
+
+:root {
+  --display: "Fraunces Variable", Georgia, serif;
+  --body: "Newsreader Variable", Georgia, serif;
+  --meta: "Archivo Narrow", "Helvetica Neue", sans-serif;
+
+  --reader-size: 19px;
+  --measure: 34rem;
+  --rule-w: 1px;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+/* --- themes ------------------------------------------------------------- */
+
+:root[data-theme="paper"] {
+  --bg: #faf7f0;
+  --bg-sunk: #f2eee4;
+  --ink: #1c1a17;
+  --ink-soft: #5d574c;
+  --ink-faint: #928a7c;
+  --rule: #ddd6c6;
+  --accent: #b8422a;
+  --accent-soft: #e8d5cd;
+  --grain: 0.035;
+}
+
+:root[data-theme="sepia"] {
+  --bg: #f3e8d3;
+  --bg-sunk: #ead9bd;
+  --ink: #3b2f22;
+  --ink-soft: #6b5a45;
+  --ink-faint: #96866e;
+  --rule: #d8c4a3;
+  --accent: #a3401f;
+  --accent-soft: #e0c9b2;
+  --grain: 0.045;
+}
+
+:root[data-theme="ink"] {
+  --bg: #16161a;
+  --bg-sunk: #1e1e23;
+  --ink: #ddd8ce;
+  --ink-soft: #9c968b;
+  --ink-faint: #6b665e;
+  --rule: #33333b;
+  --accent: #e0714f;
+  --accent-soft: #3a2a25;
+  --grain: 0.05;
+}
+
+/* --- reset -------------------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+* {
+  margin: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: 17px;
+  line-height: 1.6;
+  min-height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Paper tooth. A single inline SVG turbulence, no network request, no images. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: var(--grain);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: inherit;
+}
+
+/* --- shared type -------------------------------------------------------- */
+
+.meta {
+  font-family: var(--meta);
+  font-size: 0.7rem;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  font-weight: 400;
+}
+
+.num {
+  font-family: var(--meta);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- controls ----------------------------------------------------------- */
+
+.btn {
+  font-family: var(--meta);
+  font-size: 0.72rem;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  background: none;
+  border: var(--rule-w) solid var(--rule);
+  color: var(--ink-soft);
+  padding: 0.45rem 0.8rem;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  transition:
+    border-color 0.18s var(--ease),
+    color 0.18s var(--ease),
+    background 0.18s var(--ease);
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.btn--accent {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.btn--accent:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+.btn--on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+}
+.btn--bare {
+  border-color: transparent;
+  padding-inline: 0.4rem;
+}
+.btn--bare:hover:not(:disabled) {
+  border-color: transparent;
+  color: var(--accent);
+}
+
+.field {
+  font-family: var(--meta);
+  font-size: 0.85rem;
+  background: var(--bg-sunk);
+  border: var(--rule-w) solid var(--rule);
+  color: var(--ink);
+  padding: 0.5rem 0.6rem;
+  width: 100%;
+}
+.field:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* --- layout ------------------------------------------------------------- */
+
+.shell {
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 0 1.5rem 6rem;
+}
+
+@media (max-width: 640px) {
+  .shell {
+    padding-inline: 1rem;
+  }
+}
+
+.rule {
+  border: 0;
+  border-top: var(--rule-w) solid var(--rule);
+}
+
+/* Staggered reveal on first paint — one orchestrated moment, then stillness. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise {
+  animation: rise 0.5s var(--ease) backwards;
+}
+
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

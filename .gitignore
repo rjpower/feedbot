@@ -1,0 +1,10 @@
+node_modules/
+server/target/
+web/dist/
+.env
+*.db
+*.db-wal
+*.db-shm
+data/
+scratch/
+.DS_Store

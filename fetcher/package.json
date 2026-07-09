@@ -1,0 +1,18 @@
+{
+  "name": "feedbot-fetcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright + Readability sidecar. Renders pages, extracts articles, parses feeds.",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "@mozilla/readability": "0.6.0",
+    "fast-xml-parser": "5.9.3",
+    "jsdom": "29.1.1",
+    "playwright": "1.61.1"
+  }
+}

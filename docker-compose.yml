@@ -1,0 +1,36 @@
+# Deliberately no `ports:` — feedbot stays on the shared `web` network and is
+# reachable only through halcyon's Caddy front door, which terminates TLS and
+# routes feedbot.rjp.io here by container name.
+services:
+  feedbot:
+    build: .
+    image: feedbot:latest
+    container_name: feedbot
+    restart: unless-stopped
+    expose:
+      - "8000"
+    # halcyon symlinks secrets/feedbot.env -> ./.env. FEEDBOT_TOKEN lives there;
+    # without it the API is open to anyone who reaches the container.
+    env_file: .env
+    volumes:
+      # The sqlite database and its WAL. Survives a recreate; back this up.
+      - feedbot_data:/data
+    networks:
+      - web
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8000/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+networks:
+  web:
+    external: true
+
+volumes:
+  feedbot_data:

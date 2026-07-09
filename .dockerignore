@@ -1,0 +1,23 @@
+.git
+.gitignore
+.claude
+
+# Build outputs — the image builds its own.
+server/target
+web/dist
+**/node_modules
+
+# Secrets and local state.
+.env
+*.env
+secrets
+data
+*.db
+*.db-wal
+*.db-shm
+
+# Not needed to build or run.
+README.md
+Makefile
+docker-compose.yml
+scratch

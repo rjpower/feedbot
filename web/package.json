@@ -1,0 +1,22 @@
+{
+  "name": "feedbot-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "3.5.39",
+    "vue-router": "4.6.4"
+  },
+  "devDependencies": {
+    "@fontsource-variable/fraunces": "5.2.9",
+    "@fontsource-variable/newsreader": "5.2.10",
+    "@fontsource/archivo-narrow": "5.2.8",
+    "@vitejs/plugin-vue": "6.0.7",
+    "vite": "8.1.4"
+  }
+}
