@@ -17,7 +17,10 @@ use base64::Engine;
 use iepub::prelude::{MobiBuilder, MobiHtml, MobiNav};
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 // ---------------------------------------------------------------------------
 // XHTML helpers
@@ -75,6 +78,10 @@ const MAX_IMG_BYTES: usize = 120 * 1024;
 /// A whole-queue export shouldn't fetch thousands of images or build a
 /// half-gigabyte book; past this we stop embedding and leave the rest remote.
 const IMAGE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
+/// How many chapters fetch and transcode at once. Enough to keep the sidecar
+/// busy and stop one slow image host from stalling the whole book, without
+/// hammering a single blog's CDN (each chapter is itself up to 6 fetches).
+const BUILD_CONCURRENCY: usize = 4;
 
 static IMG_SRC: LazyLock<regex::Regex> =
     // Ammonia guarantees double-quoted attributes, so this is enough to find them.
@@ -153,9 +160,25 @@ fn meta_line(a: &Article) -> String {
     parts.join(" · ")
 }
 
+/// Reserve `len` bytes from the shared budget, returning false (and reserving
+/// nothing) if they don't fit. A compare-and-swap loop, so chapters racing to
+/// embed images can't oversubscribe it.
+fn try_reserve(budget: &AtomicUsize, len: usize) -> bool {
+    let mut cur = budget.load(Ordering::Relaxed);
+    loop {
+        if cur < len {
+            return false;
+        }
+        match budget.compare_exchange_weak(cur, cur - len, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 /// Fetch and embed `a`'s images, spending from a shared byte budget, and return
 /// the chapter with its `<img src>`s rewritten to the embedded asset names.
-async fn build_chapter(a: &Article, prefix: &str, fetch: &Fetcher, budget: &mut usize) -> Chapter {
+async fn build_chapter(a: &Article, prefix: &str, fetch: &Fetcher, budget: &AtomicUsize) -> Chapter {
     let mut html = a.content_html.clone().unwrap_or_default();
     let mut assets = Vec::new();
 
@@ -178,15 +201,20 @@ async fn build_chapter(a: &Article, prefix: &str, fetch: &Fetcher, budget: &mut 
                         failed += 1;
                         continue;
                     };
-                    let Some(jpeg) = transcode(&raw) else {
-                        failed += 1;
-                        continue;
+                    // Decode + resize + JPEG re-encode is CPU-bound; run it on the
+                    // blocking pool so other chapters' downloads keep flowing and
+                    // the work spreads across cores instead of one runtime thread.
+                    let jpeg = match tokio::task::spawn_blocking(move || transcode(&raw)).await {
+                        Ok(Some(jpeg)) => jpeg,
+                        _ => {
+                            failed += 1;
+                            continue;
+                        }
                     };
-                    if jpeg.len() > *budget {
+                    if !try_reserve(budget, jpeg.len()) {
                         tracing::warn!("mobi image budget spent; leaving remaining images remote");
                         break;
                     }
-                    *budget -= jpeg.len();
                     let name = format!("{prefix}_{i}.jpg");
                     // iepub keys assets to the chapter's img@src by exact string,
                     // so the rewritten src must equal the asset file name.
@@ -274,28 +302,54 @@ pub async fn build(
 
     let groups = group_by_site(articles);
 
-    // Build chapters in grouped order, so the text stream matches the nav.
-    let mut budget = IMAGE_BUDGET_BYTES;
-    let mut built: Vec<Built> = Vec::with_capacity(articles.len());
+    // Assign chapter ids in grouped order — the text stream and the nav must
+    // share this order — but build them concurrently and slot each back into
+    // place as it finishes, so a slow image host stalls only its own chapter.
+    let mut order: Vec<(usize, usize)> = Vec::new();
     let mut chap_id = 0usize;
     for (_sid, idxs) in &groups {
         for &i in idxs {
-            let a = &articles[i];
             chap_id += 1;
-            let ch = build_chapter(a, &format!("img{chap_id}"), fetch, &mut budget).await;
-            built.push(Built {
-                chap_id,
-                site_name: a.site_name.clone(),
-                title: ch.title,
-                html: ch.html,
-                assets: ch.assets,
-            });
-            on_progress(Progress::Article {
-                done: chap_id,
-                total: articles.len(),
-            });
+            order.push((chap_id, i));
         }
     }
+    let total = order.len();
+
+    let arts: Arc<Vec<Article>> = Arc::new(articles.to_vec());
+    let budget = Arc::new(AtomicUsize::new(IMAGE_BUDGET_BYTES));
+    let sem = Arc::new(Semaphore::new(BUILD_CONCURRENCY));
+    let mut set = JoinSet::new();
+    for (cid, ai) in order {
+        let (arts, fetch, budget, sem) = (arts.clone(), fetch.clone(), budget.clone(), sem.clone());
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("build semaphore closed");
+            let a = &arts[ai];
+            let ch = build_chapter(a, &format!("img{cid}"), &fetch, &budget).await;
+            (
+                cid,
+                Built {
+                    chap_id: cid,
+                    site_name: a.site_name.clone(),
+                    title: ch.title,
+                    html: ch.html,
+                    assets: ch.assets,
+                },
+            )
+        });
+    }
+
+    let mut slots: Vec<Option<Built>> = (0..total).map(|_| None).collect();
+    let mut done = 0usize;
+    while let Some(res) = set.join_next().await {
+        let (cid, chapter) = res.map_err(|e| anyhow::anyhow!("chapter task failed: {e}"))?;
+        done += 1;
+        on_progress(Progress::Article { done, total });
+        slots[cid - 1] = Some(chapter);
+    }
+    let built: Vec<Built> = slots
+        .into_iter()
+        .map(|b| b.expect("every chapter slot filled"))
+        .collect();
 
     let author = articles
         .iter()
