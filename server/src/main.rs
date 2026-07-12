@@ -3,6 +3,7 @@
 mod api;
 mod crawl;
 mod db;
+mod export;
 mod fetcher;
 mod mobi;
 mod urlx;
@@ -98,6 +99,7 @@ async fn main() -> Result<()> {
         pool,
         crawler,
         fetch,
+        exports: Arc::new(export::Exports::new()),
         token: cfg.token.clone().map(Arc::from),
     };
     let app = api::router(state, &cfg);

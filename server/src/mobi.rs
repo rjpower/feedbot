@@ -118,6 +118,18 @@ fn transcode(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// How far a [`build`] has gotten, for a caller that wants to show progress on a
+/// long export. Reported once per article as its images are fetched and
+/// embedded, then once when the (unsplittable) MOBI assembly begins.
+#[derive(Clone, Copy, Debug)]
+pub enum Progress {
+    Article { done: usize, total: usize },
+    Assembling,
+}
+
+/// A progress sink that discards everything, for callers with nothing to show.
+pub fn no_progress(_: Progress) {}
+
 /// One article turned into a MOBI chapter: an XHTML fragment (no `<html>`
 /// wrapper — iepub wants only the body) plus the image assets it references.
 struct Chapter {
@@ -252,7 +264,12 @@ struct Built {
 /// Build one `.mobi` from the given articles, images embedded. A multi-article
 /// export is organized one section per site, each site's posts nested beneath
 /// it in the table of contents; a single article is just itself.
-pub async fn build(articles: &[Article], title: &str, fetch: &Fetcher) -> Result<Vec<u8>> {
+pub async fn build(
+    articles: &[Article],
+    title: &str,
+    fetch: &Fetcher,
+    on_progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Vec<u8>> {
     anyhow::ensure!(!articles.is_empty(), "nothing to export");
 
     let groups = group_by_site(articles);
@@ -273,6 +290,10 @@ pub async fn build(articles: &[Article], title: &str, fetch: &Fetcher) -> Result
                 html: ch.html,
                 assets: ch.assets,
             });
+            on_progress(Progress::Article {
+                done: chap_id,
+                total: articles.len(),
+            });
         }
     }
 
@@ -291,6 +312,10 @@ pub async fn build(articles: &[Article], title: &str, fetch: &Fetcher) -> Result
     // the chapters are moved into the builder below.
     let multi = built.len() > 1;
     let navs = multi.then(|| build_nav(&groups, &built));
+
+    // Everything is fetched; the rest is serializing the book, which for a
+    // whole-queue export is a long, unsplittable step worth flagging.
+    on_progress(Progress::Assembling);
 
     let mut b = MobiBuilder::new()
         .with_title(title)

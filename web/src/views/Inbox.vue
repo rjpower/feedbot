@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import { api, downloadUrl } from "../api.js";
 import { readingTime, shortDate } from "../format.js";
@@ -59,6 +59,12 @@ watch(search, (v) => {
 });
 
 onMounted(async () => {
+  // Re-attach to an export that was in flight when we last had this view open.
+  const pending = localStorage.getItem(EXPORT_KEY);
+  if (pending) {
+    exportJob.value = { id: pending, status: "running", phase: "selecting", done: 0, total: 0 };
+    watchExport();
+  }
   await load();
   try {
     sites.value = await api.sites();
@@ -101,13 +107,87 @@ async function markAllRead() {
   await load();
 }
 
-// The export takes up to per_site of each site's newest, not a flat cut, so
-// every site lands in the book instead of the most prolific few.
-const mobiHref = computed(() => {
-  const q = new URLSearchParams({ state: state.value, per_site: "10" });
-  if (siteId.value) q.set("site_id", String(siteId.value));
-  return downloadUrl(`/export/mobi?${q}`);
+// A whole-list export builds server-side — it fetches and transcodes every
+// post's images, which takes minutes — so we start a job, watch its progress,
+// and hand the finished .mobi to the browser. The job id lives in localStorage
+// so the progress survives a reload or a round-trip into the reader. The export
+// takes up to per_site of each site's newest (not a flat cut) so every site
+// lands in the book, not just the most prolific few.
+const EXPORT_KEY = "feedbot:export";
+const exportJob = ref(null);
+let exportTimer;
+
+const exporting = computed(() => exportJob.value?.status === "running");
+
+const exportLabel = computed(() => {
+  const j = exportJob.value;
+  if (!j) return "";
+  if (j.status === "failed") return j.error || "Export failed";
+  if (j.status === "done") return `Ready · ${(j.size / 1048576).toFixed(1)} MB`;
+  if (j.phase === "assembling") return "Assembling…";
+  if (j.total) return `Fetching images · ${j.done}/${j.total}`;
+  return "Preparing…";
 });
+
+const exportPct = computed(() => {
+  const j = exportJob.value;
+  if (!j || !j.total) return 0;
+  if (j.phase === "assembling" || j.status === "done") return 100;
+  return Math.round((j.done / j.total) * 100);
+});
+
+function exportUrl(id) {
+  return downloadUrl(`/export/mobi/${id}/download`);
+}
+
+// <a download> click rather than location change, so the download starts without
+// navigating away from the inbox. The visible link is the fallback if it's blocked.
+function triggerDownload(id) {
+  const a = document.createElement("a");
+  a.href = exportUrl(id);
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function watchExport() {
+  clearTimeout(exportTimer);
+  exportTimer = setTimeout(async () => {
+    const id = exportJob.value?.id;
+    if (!id) return;
+    try {
+      const j = await api.exportStatus(id);
+      exportJob.value = j;
+      if (j.status === "running") {
+        watchExport();
+      } else {
+        localStorage.removeItem(EXPORT_KEY);
+        if (j.status === "done") triggerDownload(id);
+      }
+    } catch {
+      // Aged out of the server's cache, or the server restarted — forget it.
+      exportJob.value = null;
+      localStorage.removeItem(EXPORT_KEY);
+    }
+  }, 1000);
+}
+
+async function startExport() {
+  error.value = "";
+  try {
+    const params = { state: state.value, per_site: 10 };
+    if (siteId.value) params.site_id = siteId.value;
+    const j = await api.startExport(params);
+    exportJob.value = j;
+    localStorage.setItem(EXPORT_KEY, j.id);
+    watchExport();
+  } catch (e) {
+    error.value = e.message;
+  }
+}
+
+onUnmounted(() => clearTimeout(exportTimer));
 
 const emptyMessage = computed(() => {
   if (route.query.q) return `Nothing matches “${route.query.q}”.`;
@@ -148,7 +228,30 @@ const emptyMessage = computed(() => {
     </div>
 
     <div v-if="articles.length" class="actions">
-      <a class="btn btn--bare" :href="mobiHref" title="Download for Kindle: up to 10 newest per site, images embedded">↓ MOBI</a>
+      <div v-if="exportJob" class="export" :class="`export--${exportJob.status}`">
+        <div v-if="exporting" class="export__track" role="progressbar" :aria-valuenow="exportPct">
+          <span class="export__fill" :style="{ width: `${exportPct}%` }" />
+        </div>
+        <span class="export__label meta">{{ exportLabel }}</span>
+        <a
+          v-if="exportJob.status === 'done'"
+          class="btn btn--bare"
+          :href="exportUrl(exportJob.id)"
+          title="Download the finished .mobi"
+        >↓ .mobi</a>
+        <button
+          v-if="!exporting"
+          class="btn btn--bare"
+          title="Build it again"
+          @click="startExport"
+        >↻</button>
+      </div>
+      <button
+        v-else
+        class="btn btn--bare"
+        title="Build a Kindle .mobi: up to 10 newest per site, images embedded"
+        @click="startExport"
+      >↓ MOBI</button>
       <button class="btn btn--bare" @click="markAllRead">Mark all read</button>
     </div>
 
@@ -262,8 +365,35 @@ const emptyMessage = computed(() => {
 .actions {
   display: flex;
   gap: 0.4rem;
+  align-items: center;
   justify-content: flex-end;
   margin-bottom: 0.4rem;
+}
+
+.export {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.export__track {
+  width: 7rem;
+  height: 0.3rem;
+  background: var(--bg-sunk);
+  border: var(--rule-w) solid var(--rule);
+  overflow: hidden;
+}
+.export__fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.4s var(--ease);
+}
+.export__label {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.export--failed .export__label {
+  color: var(--accent);
 }
 
 .notice {

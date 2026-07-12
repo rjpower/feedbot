@@ -89,6 +89,16 @@ export const api = {
     request("/articles/read-all", { method: "POST", body: { site_id: siteId ?? null } }),
 
   crawls: () => request("/crawls"),
+
+  // A whole-list export builds in the background: start it, then poll by id
+  // until it's done and pull the .mobi from downloadUrl(`/export/mobi/${id}/download`).
+  startExport: (params = {}) => {
+    const q = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== ""),
+    );
+    return request(`/export/mobi?${q}`, { method: "POST" });
+  },
+  exportStatus: (id) => request(`/export/mobi/${id}`),
 };
 
 /** Check the token we have, if any, before rendering anything else. */

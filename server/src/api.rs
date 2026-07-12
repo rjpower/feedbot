@@ -2,6 +2,7 @@
 
 use crate::crawl::{CrawlOutcome, Crawler};
 use crate::db::{self, ArticleQuery, NewSite, Pool, SitePatch};
+use crate::export::Exports;
 use crate::{Config, mobi};
 use axum::{
     Json, Router,
@@ -22,6 +23,7 @@ pub struct AppState {
     pub pool: Pool,
     pub crawler: Arc<Crawler>,
     pub fetch: crate::fetcher::Fetcher,
+    pub exports: Arc<Exports>,
     pub token: Option<Arc<str>>,
 }
 
@@ -444,7 +446,15 @@ async fn article_mobi(State(st): State<AppState>, Path(id): Path<i64>) -> ApiRes
         .await?
         .ok_or_else(|| ApiError::not_found("no such article"))?;
     let name = mobi::safe_filename(&article.title);
-    let bytes = mobi::build(std::slice::from_ref(&article), &article.title, &st.fetch).await?;
+    // One article is quick, so it stays a plain synchronous download — no job,
+    // nothing to report progress about.
+    let bytes = mobi::build(
+        std::slice::from_ref(&article),
+        &article.title,
+        &st.fetch,
+        &mobi::no_progress,
+    )
+    .await?;
     Ok(mobi_response(bytes, &name))
 }
 
@@ -463,38 +473,60 @@ pub struct ExportQuery {
     per_site: Option<i64>,
 }
 
-/// A reading list as a Kindle-native `.mobi`: one section per site, each site's
-/// most-recent posts nested beneath it, with every image embedded rather than
-/// left as a dead remote link.
-async fn export_mobi(
+/// Start a reading-list export — one section per site, each site's most-recent
+/// posts nested beneath it, every image embedded rather than left a dead remote
+/// link. The book takes minutes to build, so this returns a job to poll rather
+/// than the bytes; [`download_export`] serves the `.mobi` once it's ready.
+async fn start_export(
     State(st): State<AppState>,
     Query(q): Query<ExportQuery>,
-) -> ApiResult<Response> {
-    let label = q.state.clone().unwrap_or_else(|| "unread".into());
+) -> (StatusCode, Json<crate::export::JobView>) {
+    let label = q.state.unwrap_or_else(|| "unread".into());
     let per_site = q.per_site.unwrap_or(DEFAULT_PER_SITE);
-    let site_id = q.site_id;
-    let state = label.clone();
-    let articles = db::call(&st.pool, move |c| {
-        let summaries = db::list_articles_per_site(c, &state, site_id, per_site)?;
-        summaries
-            .iter()
-            .map(|s| {
-                db::get_article(c, s.id)?
-                    .ok_or_else(|| anyhow::anyhow!("article {} vanished mid-export", s.id))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-    })
-    .await?;
+    let job = st.exports.start(
+        st.pool.clone(),
+        st.fetch.clone(),
+        label,
+        q.site_id,
+        per_site,
+    );
+    (StatusCode::ACCEPTED, Json(job.view()))
+}
 
-    if articles.is_empty() {
-        return Err(ApiError::bad("no articles match that filter"));
+/// Where the poller lives: phase and articles-done while running, byte size when
+/// the book is ready, the error if it failed.
+async fn export_status(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<crate::export::JobView>> {
+    st.exports
+        .get(&id)
+        .map(|j| Json(j.view()))
+        .ok_or_else(|| ApiError::not_found("no such export"))
+}
+
+/// The finished `.mobi`. A plain GET with a query-param token, so the e-reader
+/// can pull it straight from the download the SPA hands it. 409 until it's ready.
+async fn download_export(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let job = st
+        .exports
+        .get(&id)
+        .ok_or_else(|| ApiError::not_found("no such export"))?;
+    match job.bytes() {
+        Some(bytes) => Ok(mobi_response(bytes.to_vec(), &job.filename)),
+        None => Err(ApiError(
+            StatusCode::CONFLICT,
+            "export is not ready yet".into(),
+        )),
     }
-    let title = format!("feedbot — {label}");
-    let bytes = mobi::build(&articles, &title, &st.fetch).await?;
-    Ok(mobi_response(
-        bytes,
-        &format!("feedbot-{}", mobi::safe_filename(&label)),
-    ))
+}
+
+/// Recent export jobs, newest first — lets the UI re-attach after a reload.
+async fn list_exports(State(st): State<AppState>) -> Json<Vec<crate::export::JobView>> {
+    Json(st.exports.list())
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +567,10 @@ pub fn router(state: AppState, cfg: &Config) -> Router {
         .route("/articles/{id}/read", post(set_read))
         .route("/articles/{id}/star", post(set_starred))
         .route("/articles/{id}/mobi", get(article_mobi))
-        .route("/export/mobi", get(export_mobi))
+        .route("/export/mobi", post(start_export))
+        .route("/export/mobi/{id}", get(export_status))
+        .route("/export/mobi/{id}/download", get(download_export))
+        .route("/exports", get(list_exports))
         // Without this, an unknown /api path falls through to the SPA and a
         // typo'd endpoint answers with a page of HTML.
         .fallback(|| async { ApiError::not_found("no such endpoint") })
