@@ -393,7 +393,18 @@ pub async fn build(
         b = b.add_nav(nav);
     }
 
-    b.mem().map_err(|e| anyhow::anyhow!("{e}")).context("generating mobi")
+    let bytes = b.mem().map_err(|e| anyhow::anyhow!("{e}")).context("generating mobi")?;
+
+    // iepub writes only an inline HTML TOC; splice in the NCX index a Kindle
+    // reads for its native chapter list. Best-effort — a book without the index
+    // still opens fine, so a failure here must not sink the export.
+    Ok(match crate::ncx::add_toc(&bytes) {
+        Ok(with_toc) => with_toc,
+        Err(e) => {
+            tracing::warn!("mobi built without a Kindle chapter index: {e:#}");
+            bytes
+        }
+    })
 }
 
 /// A two-level table of contents: one parent per site (pointing at its first

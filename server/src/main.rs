@@ -6,6 +6,7 @@ mod db;
 mod export;
 mod fetcher;
 mod mobi;
+mod ncx;
 mod urlx;
 
 use anyhow::{Context, Result};
