@@ -47,6 +47,8 @@ async function submit() {
 
 <style scoped>
 .lock {
+  /* See styles.css: vh is the fallback for engines without dvh. */
+  min-height: 100vh;
   min-height: 100dvh;
   display: grid;
   place-items: center;

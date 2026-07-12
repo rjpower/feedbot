@@ -2,7 +2,7 @@
 
 use crate::crawl::{CrawlOutcome, Crawler};
 use crate::db::{self, ArticleQuery, NewSite, Pool, SitePatch};
-use crate::{Config, epub};
+use crate::{Config, epub, mobi};
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
@@ -21,6 +21,7 @@ use tower_http::trace::TraceLayer;
 pub struct AppState {
     pub pool: Pool,
     pub crawler: Arc<Crawler>,
+    pub fetch: crate::fetcher::Fetcher,
     pub token: Option<Arc<str>>,
 }
 
@@ -476,6 +477,64 @@ async fn export_epub(
 }
 
 // ---------------------------------------------------------------------------
+// MOBI
+// ---------------------------------------------------------------------------
+
+fn mobi_response(bytes: Vec<u8>, filename: &str) -> Response {
+    (
+        [
+            // The type the Kindle browser recognizes as "a book to download".
+            (header::CONTENT_TYPE, "application/x-mobipocket-ebook".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}.mobi\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn article_mobi(State(st): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
+    let article = db::call(&st.pool, move |c| db::get_article(c, id))
+        .await?
+        .ok_or_else(|| ApiError::not_found("no such article"))?;
+    let name = epub::safe_filename(&article.title);
+    let bytes = mobi::build(std::slice::from_ref(&article), &article.title, &st.fetch).await?;
+    Ok(mobi_response(bytes, &name))
+}
+
+/// The same reading list as the EPUB export, but as a Kindle-native `.mobi`
+/// with every article image embedded rather than left as a dead remote link.
+async fn export_mobi(
+    State(st): State<AppState>,
+    Query(q): Query<ArticleQuery>,
+) -> ApiResult<Response> {
+    let label = q.state.clone().unwrap_or_else(|| "unread".into());
+    let articles = db::call(&st.pool, move |c| {
+        let summaries = db::list_articles(c, &q)?;
+        summaries
+            .iter()
+            .map(|s| {
+                db::get_article(c, s.id)?
+                    .ok_or_else(|| anyhow::anyhow!("article {} vanished mid-export", s.id))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+    })
+    .await?;
+
+    if articles.is_empty() {
+        return Err(ApiError::bad("no articles match that filter"));
+    }
+    let title = format!("feedbot — {label}");
+    let bytes = mobi::build(&articles, &title, &st.fetch).await?;
+    Ok(mobi_response(
+        bytes,
+        &format!("feedbot-{}", epub::safe_filename(&label)),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Misc
 // ---------------------------------------------------------------------------
 
@@ -513,7 +572,9 @@ pub fn router(state: AppState, cfg: &Config) -> Router {
         .route("/articles/{id}/read", post(set_read))
         .route("/articles/{id}/star", post(set_starred))
         .route("/articles/{id}/epub", get(article_epub))
+        .route("/articles/{id}/mobi", get(article_mobi))
         .route("/export/epub", get(export_epub))
+        .route("/export/mobi", get(export_mobi))
         // Without this, an unknown /api path falls through to the SPA and a
         // typo'd endpoint answers with a page of HTML.
         .fallback(|| async { ApiError::not_found("no such endpoint") })

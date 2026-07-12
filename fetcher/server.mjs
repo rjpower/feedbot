@@ -607,10 +607,74 @@ async function feed({ url }) {
 }
 
 // ---------------------------------------------------------------------------
+// Images
+// ---------------------------------------------------------------------------
+
+// One image should never blow up the process; a blog hero can be large, but not
+// this large. Anything past this is almost certainly not something we want to
+// staple into an e-book anyway.
+const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
+const IMAGE_FETCH_CONCURRENCY = 6;
+
+/** Fetch one image's bytes, or return why we couldn't. Never throws. */
+async function fetchImage(rawUrl, referer) {
+  let target;
+  try {
+    target = await assertPublicUrl(rawUrl);
+  } catch (e) {
+    return { url: rawUrl, ok: false, error: e.message };
+  }
+  const { userAgent } = await identity();
+  const headers = { "user-agent": userAgent, accept: "image/avif,image/webp,image/*,*/*;q=0.8" };
+  // A referer matching the article satisfies the hotlink protection some blogs
+  // put on their image host (Blogger's googleusercontent is lenient; others are
+  // not).
+  if (referer) headers.referer = referer;
+
+  try {
+    const res = await fetch(target.href, {
+      headers,
+      redirect: "follow",
+      signal: AbortSignal.timeout(NAV_TIMEOUT_MS),
+    });
+    if (!res.ok) return { url: rawUrl, ok: false, error: `HTTP ${res.status}` };
+    const type = (res.headers.get("content-type") || "").split(";")[0].trim();
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length === 0) return { url: rawUrl, ok: false, error: "empty body" };
+    if (buf.length > MAX_IMAGE_BYTES) {
+      return { url: rawUrl, ok: false, error: `too large (${buf.length} bytes)` };
+    }
+    return { url: rawUrl, ok: true, contentType: type || "application/octet-stream", dataB64: buf.toString("base64") };
+  } catch (e) {
+    return { url: rawUrl, ok: false, error: e.name === "TimeoutError" ? "timeout" : e.message };
+  }
+}
+
+/**
+ * Fetch a batch of image URLs for embedding into an export. Returns one result
+ * per input URL, in order, each either bytes or an error — a single dead image
+ * must not sink the whole book, so nothing here rejects.
+ */
+async function images({ urls, referer }) {
+  if (!Array.isArray(urls)) throw new HttpError(400, "images: `urls` must be an array");
+  const out = new Array(urls.length);
+  let next = 0;
+  async function worker() {
+    while (next < urls.length) {
+      const i = next++;
+      out[i] = await fetchImage(urls[i], referer);
+    }
+  }
+  const workers = Array.from({ length: Math.min(IMAGE_FETCH_CONCURRENCY, urls.length) }, worker);
+  await Promise.all(workers);
+  return { images: out };
+}
+
+// ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
-const ROUTES = { "/discover": discover, "/feed": feed, "/article": article };
+const ROUTES = { "/discover": discover, "/feed": feed, "/article": article, "/images": images };
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -657,9 +721,11 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       throw new HttpError(400, `bad JSON: ${e.message}`);
     }
-    if (!payload.url) throw new HttpError(400, "missing url");
+    // Each handler validates its own inputs (every one calls assertPublicUrl,
+    // which rejects a missing or bad URL) — so there's no single `url` to check
+    // here, and /images takes a list rather than one.
     const out = await handler(payload);
-    log(`${path} ${payload.url} ok in ${Date.now() - started}ms`);
+    log(`${path} ${payload.url || `${payload.urls?.length ?? "?"} urls`} ok in ${Date.now() - started}ms`);
     send(res, 200, { ok: true, ...out });
   } catch (e) {
     const status = e instanceof HttpError ? e.status : 502;

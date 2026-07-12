@@ -83,6 +83,9 @@ body {
   font-family: var(--body);
   font-size: 17px;
   line-height: 1.6;
+  /* vh first: an engine without dvh (Chrome < 108, e.g. the Kindle) keeps this
+     one and drops the next. Both lines are load-bearing. */
+  min-height: 100vh;
   min-height: 100dvh;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;

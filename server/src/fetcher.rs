@@ -50,6 +50,25 @@ pub struct ArticleDoc {
     pub word_count: i64,
 }
 
+/// One image the sidecar tried to fetch. `data_b64` is present iff `ok`; the
+/// sidecar also sends `contentType`, but we re-encode every image regardless of
+/// its declared type, so we don't deserialize it.
+#[derive(Debug, Deserialize)]
+pub struct FetchedImage {
+    pub url: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Base64 from the sidecar; decoded lazily by the caller.
+    #[serde(default, rename = "dataB64")]
+    pub data_b64: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImagesResponse {
+    images: Vec<FetchedImage>,
+}
+
 /// The sidecar answers `{ok: false, error}` for anything it refuses or fails.
 #[derive(Deserialize)]
 struct Envelope {
@@ -105,6 +124,34 @@ impl Fetcher {
 
     pub async fn article(&self, url: &str) -> Result<ArticleDoc> {
         self.post("/article", url).await
+    }
+
+    /// Fetch a batch of image URLs for embedding, with `referer` set to the
+    /// article so hotlink-protected image hosts answer. One result per input
+    /// URL, each either bytes or an error; the batch as a whole succeeds even if
+    /// every image fails.
+    pub async fn images(&self, urls: &[String], referer: &str) -> Result<Vec<FetchedImage>> {
+        if urls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = self
+            .http
+            .post(format!("{}/images", self.base))
+            .json(&serde_json::json!({ "urls": urls, "referer": referer }))
+            .send()
+            .await
+            .context("POST /images")?
+            .text()
+            .await?;
+
+        let env: Envelope = serde_json::from_str(&body)
+            .with_context(|| format!("/images returned non-JSON: {}", truncate(&body, 200)))?;
+        if !env.ok {
+            bail!("{}", env.error.unwrap_or_else(|| "fetcher error".into()));
+        }
+        let parsed: ImagesResponse = serde_json::from_str(&body)
+            .with_context(|| format!("/images payload did not match schema: {}", truncate(&body, 200)))?;
+        Ok(parsed.images)
     }
 
     pub async fn healthy(&self) -> bool {

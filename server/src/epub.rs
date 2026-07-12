@@ -19,13 +19,13 @@ static VOID_TAG: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// It also serializes U+00A0 as `&nbsp;`, and XHTML defines only five entities
 /// — `amp`, `lt`, `gt`, `quot`, `apos`. An e-reader's XML parser rejects the
 /// whole chapter over one non-breaking space, so spell it numerically.
-fn to_xhtml(html: &str) -> String {
+pub(crate) fn to_xhtml(html: &str) -> String {
     VOID_TAG
         .replace_all(html, "<$1$2/>")
         .replace("&nbsp;", "&#160;")
 }
 
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

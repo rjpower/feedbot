@@ -115,7 +115,8 @@ watch(() => route.params.id, (id) => id && load(id));
         >
           {{ article.starred ? "★" : "☆" }}
         </button>
-        <a class="btn btn--bare" :href="downloadUrl(`/articles/${article.id}/epub`)" title="Download EPUB">↓</a>
+        <a class="btn btn--bare" :href="downloadUrl(`/articles/${article.id}/mobi`)" title="Download for Kindle (.mobi, images embedded)">↓ MOBI</a>
+        <a class="btn btn--bare" :href="downloadUrl(`/articles/${article.id}/epub`)" title="Download EPUB">↓ EPUB</a>
       </div>
     </nav>
 
@@ -180,6 +181,9 @@ watch(() => route.params.id, (id) => id && load(id));
   gap: 0.5rem;
   padding: 0.9rem 0;
   margin-bottom: 1.5rem;
+  /* Opaque first. Without color-mix (Chrome < 111) the toolbar would have no
+     background at all and the article would scroll through it. */
+  background: var(--bg);
   background: color-mix(in srgb, var(--bg) 92%, transparent);
   backdrop-filter: blur(8px);
   border-bottom: var(--rule-w) solid var(--rule);
@@ -229,6 +233,8 @@ watch(() => route.params.id, (id) => id && load(id));
   font-family: var(--display);
   font-variation-settings: "SOFT" 40, "WONK" 1;
   font-weight: 600;
+  /* clamp() is Chrome 79; the Kindle may be a few versions short of it. */
+  font-size: 2.3rem;
   font-size: clamp(1.9rem, 5.4vw, 2.7rem);
   line-height: 1.1;
   letter-spacing: -0.022em;
@@ -364,6 +370,19 @@ watch(() => route.params.id, (id) => id && load(id));
   display: block;
   overflow-x: auto;
 }
+/* Chrome < 105 has no :has() and throws away every rule below that uses it.
+   These two are the baseline it keeps: padded, left-aligned cells with a ruled
+   header. A data table stays legible there; a layout table is merely roomier
+   than it ought to be. */
+.prose :deep(table th),
+.prose :deep(table td) {
+  padding: 0.5em 0.7em;
+  text-align: left;
+}
+.prose :deep(table th) {
+  border: var(--rule-w) solid var(--rule);
+}
+
 /* Blogger wraps captioned images in a borderless layout table. Only a table
    with a header row is really tabular data, so only that one gets rules. */
 .prose :deep(table:has(th)) {

@@ -179,6 +179,29 @@ async function main() {
     check("  found links", (d.links || []).length > 20, `${(d.links || []).length} links`);
   }
 
+  // The MOBI export embeds images, which it fetches in a batch through here.
+  // One dead image must not sink the book, so the batch always succeeds and
+  // reports per-image; the SSRF guard applies to each URL just like /article.
+  console.log("\n=== image batch fetch for embedding");
+  {
+    // Pull a real image URL off a seed post rather than hardcoding one that rots.
+    const art = await post("/article", {
+      url: "https://crpgaddict.blogspot.com/2026/07/al-qadim-genies-betrayal.html",
+    });
+    const src = (art.html || "").match(/<img[^>]+src="([^"]+)"/)?.[1];
+    check("found an image on the seed post", !!src, src);
+
+    const r = await post("/images", {
+      urls: [src, "http://169.254.169.254/latest/meta-data/"],
+      referer: "https://crpgaddict.blogspot.com/",
+    });
+    check("batch ok", r.ok === true, r.error);
+    check("one result per url", (r.images || []).length === 2, `${r.images?.length} results`);
+    check("real image came back with bytes", r.images?.[0]?.ok === true && (r.images[0].dataB64 || "").length > 100, r.images?.[0]?.error);
+    check("SSRF address refused per-item", r.images?.[1]?.ok === false, JSON.stringify(r.images?.[1]));
+    check("batch survives a bad item", r.images?.[0]?.ok === true, "one failure should not fail the batch");
+  }
+
   console.log("\n=== SSRF guard");
   for (const bad of [
     "http://127.0.0.1:4000/healthz",

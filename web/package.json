@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "build": "vite build && npm run check",
+    "preview": "vite preview",
+    "check": "node scripts/check-legacy.mjs"
   },
   "dependencies": {
     "vue": "3.5.39",
@@ -17,6 +18,7 @@
     "@fontsource-variable/newsreader": "5.2.10",
     "@fontsource/archivo-narrow": "5.2.8",
     "@vitejs/plugin-vue": "6.0.7",
+    "acorn": "8.17.0",
     "vite": "8.1.4"
   }
 }

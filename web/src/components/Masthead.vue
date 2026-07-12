@@ -57,6 +57,8 @@ const themeLabel = () => THEMES.find((t) => t.id === theme.id)?.label ?? "Paper"
 .wordmark {
   font-family: var(--display);
   font-weight: 600;
+  /* clamp() is Chrome 79; the Kindle may be a few versions short of it. */
+  font-size: 2.1rem;
   font-size: clamp(1.9rem, 5vw, 2.5rem);
   font-variation-settings: "SOFT" 40, "WONK" 1;
   letter-spacing: -0.02em;

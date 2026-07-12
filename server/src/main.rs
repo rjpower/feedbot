@@ -5,6 +5,7 @@ mod crawl;
 mod db;
 mod epub;
 mod fetcher;
+mod mobi;
 mod urlx;
 
 use anyhow::{Context, Result};
@@ -91,12 +92,13 @@ async fn main() -> Result<()> {
         .context("the fetch sidecar never came up")?;
     tracing::info!("fetcher healthy at {}", cfg.fetcher_url);
 
-    let crawler = Arc::new(crawl::Crawler::new(pool.clone(), fetch, cfg.crawl_delay));
+    let crawler = Arc::new(crawl::Crawler::new(pool.clone(), fetch.clone(), cfg.crawl_delay));
     crawl::schedule(crawler.clone(), cfg.scheduler_tick);
 
     let state = api::AppState {
         pool,
         crawler,
+        fetch,
         token: cfg.token.clone().map(Arc::from),
     };
     let app = api::router(state, &cfg);
