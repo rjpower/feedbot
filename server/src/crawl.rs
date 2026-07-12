@@ -319,6 +319,13 @@ impl Crawler {
         // v-html. Ammonia strips scripts, event handlers, and javascript: URLs.
         let content_html = ammonia::clean(&doc.html);
 
+        // Pull every image local and content-addressed while we're already here:
+        // the reader and the offline export both want them stored, not hotlinked.
+        // Referer is the article itself, which hotlink-protected hosts want.
+        let content_html =
+            crate::images::capture_html(&self.pool, &self.fetcher, &content_html, canonical.as_str())
+                .await;
+
         let row = NewArticle {
             site_id: site.id,
             url: canonical.to_string(),

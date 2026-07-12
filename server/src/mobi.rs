@@ -10,10 +10,10 @@
 //! sidecar (the single network chokepoint) and staple the bytes in as MOBI
 //! image records.
 
-use crate::db::Article;
+use crate::db::{self, Article, Pool};
 use crate::fetcher::Fetcher;
+use crate::images;
 use anyhow::{Context, Result};
-use base64::Engine;
 use iepub::prelude::{MobiBuilder, MobiHtml, MobiNav};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -69,61 +69,15 @@ pub fn safe_filename(title: &str) -> String {
     }
 }
 
-/// Kindle e-ink panels top out around 1264×1680. Anything larger is detail the
-/// device can't show, and bytes MOBI's per-image record can't afford.
-const MAX_IMG_W: u32 = 1264;
-const MAX_IMG_H: u32 = 1680;
-/// MOBI7 silently drops an image whose record exceeds ~127 KB. Stay under it.
-const MAX_IMG_BYTES: usize = 120 * 1024;
-/// A whole-queue export shouldn't fetch thousands of images or build a
-/// half-gigabyte book; past this we stop embedding and leave the rest remote.
+/// A whole-queue export shouldn't embed a half-gigabyte of images; past this we
+/// stop embedding and leave the rest as remote links. Images are already
+/// transcoded to [`images::MAX_IMG_BYTES`] at capture time, so this only bounds
+/// the total, not any single picture.
 const IMAGE_BUDGET_BYTES: usize = 48 * 1024 * 1024;
-/// How many chapters fetch and transcode at once. Enough to keep the sidecar
-/// busy and stop one slow image host from stalling the whole book, without
-/// hammering a single blog's CDN (each chapter is itself up to 6 fetches).
+/// How many chapters assemble at once. Enough to overlap the occasional
+/// on-demand image capture (for a post crawled before capture existed) without
+/// hammering a single blog's CDN.
 const BUILD_CONCURRENCY: usize = 4;
-
-static IMG_SRC: LazyLock<regex::Regex> =
-    // Ammonia guarantees double-quoted attributes, so this is enough to find them.
-    LazyLock::new(|| regex::Regex::new(r#"<img\b[^>]*?\bsrc="([^"]+)""#).unwrap());
-
-/// The distinct `src` URLs in an article's HTML, in first-seen order.
-fn image_srcs(html: &str) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    IMG_SRC
-        .captures_iter(html)
-        .filter_map(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-        .filter(|u| seen.insert(u.clone()))
-        .collect()
-}
-
-/// Decode any web image and re-encode it as a JPEG that fits MOBI's budget,
-/// shrinking until it does. Returns None for bytes we can't decode.
-fn transcode(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut img = image::load_from_memory(bytes).ok()?;
-    // `resize` fits to the box in both directions and will happily *upscale* a
-    // thumbnail into a bigger, blurrier, heavier file — so only ever shrink.
-    if img.width() > MAX_IMG_W || img.height() > MAX_IMG_H {
-        img = img.resize(MAX_IMG_W, MAX_IMG_H, image::imageops::FilterType::Lanczos3);
-    }
-    for attempt in 0..4 {
-        let mut out = Cursor::new(Vec::new());
-        // JPEG quality steps down each retry; a screenshot survives 60 fine.
-        let quality = 82 - attempt * 8;
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
-        if img.to_rgb8().write_with_encoder(encoder).is_err() {
-            return None;
-        }
-        let out = out.into_inner();
-        if out.len() <= MAX_IMG_BYTES || attempt == 3 {
-            return Some(out);
-        }
-        // Still too big: halve the pixels and try again at lower quality.
-        img = img.resize(img.width() * 7 / 10, img.height() * 7 / 10, image::imageops::FilterType::Triangle);
-    }
-    None
-}
 
 /// How far a [`build`] has gotten, for a caller that wants to show progress on a
 /// long export. Reported once per article as its images are fetched and
@@ -176,57 +130,51 @@ fn try_reserve(budget: &AtomicUsize, len: usize) -> bool {
     }
 }
 
-/// Fetch and embed `a`'s images, spending from a shared byte budget, and return
-/// the chapter with its `<img src>`s rewritten to the embedded asset names.
-async fn build_chapter(a: &Article, prefix: &str, fetch: &Fetcher, budget: &AtomicUsize) -> Chapter {
-    let mut html = a.content_html.clone().unwrap_or_default();
-    let mut assets = Vec::new();
+/// Turn `a` into a chapter, embedding its captured images from the store and
+/// spending from a shared byte budget. Most articles already carry
+/// `/img/<hash>` refs from crawl time, so this is a pair of DB reads; one
+/// crawled before capture existed is captured on demand here (fetched and
+/// transcoded through the sidecar), which the background backfill also does.
+async fn build_chapter(
+    a: &Article,
+    prefix: &str,
+    pool: &Pool,
+    fetch: &Fetcher,
+    budget: &AtomicUsize,
+) -> Chapter {
+    let raw = a.content_html.clone().unwrap_or_default();
+    // Pull any still-remote images local (no-op once an article is captured),
+    // then load the captured bytes to staple into the book.
+    let mut html = images::capture_html(pool, fetch, &raw, &a.url).await;
 
-    let srcs = image_srcs(&html);
-    if !srcs.is_empty() {
-        // Referer is the article itself, which is what hotlink-protected image
-        // hosts want to see.
-        match fetch.images(&srcs, &a.url).await {
-            Ok(results) => {
-                let mut failed = 0;
-                for (i, r) in results.iter().enumerate() {
-                    let Some(b64) = r.data_b64.as_deref().filter(|_| r.ok) else {
-                        // A dead image stays absent; its alt text remains. Note
-                        // why, at debug, so a systematically-blocked host shows up.
-                        failed += 1;
-                        tracing::debug!("skipping image {}: {}", r.url, r.error.as_deref().unwrap_or("no data"));
-                        continue;
-                    };
-                    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) else {
-                        failed += 1;
-                        continue;
-                    };
-                    // Decode + resize + JPEG re-encode is CPU-bound; run it on the
-                    // blocking pool so other chapters' downloads keep flowing and
-                    // the work spreads across cores instead of one runtime thread.
-                    let jpeg = match tokio::task::spawn_blocking(move || transcode(&raw)).await {
-                        Ok(Some(jpeg)) => jpeg,
-                        _ => {
-                            failed += 1;
-                            continue;
-                        }
-                    };
-                    if !try_reserve(budget, jpeg.len()) {
-                        tracing::warn!("mobi image budget spent; leaving remaining images remote");
-                        break;
-                    }
-                    let name = format!("{prefix}_{i}.jpg");
-                    // iepub keys assets to the chapter's img@src by exact string,
-                    // so the rewritten src must equal the asset file name.
-                    html = html.replace(&format!("src=\"{}\"", r.url), &format!("src=\"{name}\""));
-                    assets.push((name, jpeg));
-                }
-                if failed > 0 {
-                    tracing::info!("{}: embedded {} images, {failed} unavailable", a.url, assets.len());
-                }
-            }
-            Err(e) => tracing::warn!("fetching images for {}: {e:#}", a.url),
+    let srcs = images::image_srcs(&html);
+    let hashes: Vec<String> = srcs
+        .iter()
+        .filter_map(|s| images::local_hash(s).map(str::to_string))
+        .collect();
+    let blobs = if hashes.is_empty() {
+        HashMap::new()
+    } else {
+        db::call(pool, move |c| db::image_bytes_many(c, &hashes))
+            .await
+            .unwrap_or_default()
+    };
+
+    let mut assets = Vec::new();
+    for (i, src) in srcs.iter().enumerate() {
+        let Some(hash) = images::local_hash(src) else {
+            continue; // a remote src whose capture failed; leave it, alt text shows
+        };
+        let Some(bytes) = blobs.get(hash) else { continue };
+        if !try_reserve(budget, bytes.len()) {
+            tracing::warn!("mobi image budget spent; leaving remaining images remote");
+            break;
         }
+        let name = format!("{prefix}_{i}.jpg");
+        // iepub keys assets to the chapter's img@src by exact string, so the
+        // rewritten src must equal the asset file name.
+        html = html.replace(&format!("src=\"{src}\""), &format!("src=\"{name}\""));
+        assets.push((name, bytes.clone()));
     }
 
     let fragment = format!(
@@ -295,6 +243,7 @@ struct Built {
 pub async fn build(
     articles: &[Article],
     title: &str,
+    pool: &Pool,
     fetch: &Fetcher,
     on_progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<Vec<u8>> {
@@ -320,11 +269,12 @@ pub async fn build(
     let sem = Arc::new(Semaphore::new(BUILD_CONCURRENCY));
     let mut set = JoinSet::new();
     for (cid, ai) in order {
-        let (arts, fetch, budget, sem) = (arts.clone(), fetch.clone(), budget.clone(), sem.clone());
+        let (arts, pool, fetch, budget, sem) =
+            (arts.clone(), pool.clone(), fetch.clone(), budget.clone(), sem.clone());
         set.spawn(async move {
             let _permit = sem.acquire_owned().await.expect("build semaphore closed");
             let a = &arts[ai];
-            let ch = build_chapter(a, &format!("img{cid}"), &fetch, &budget).await;
+            let ch = build_chapter(a, &format!("img{cid}"), &pool, &fetch, &budget).await;
             (
                 cid,
                 Built {
@@ -433,41 +383,6 @@ fn build_nav(groups: &[(i64, Vec<usize>)], built: &[Built]) -> Vec<MobiNav> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extracts_distinct_srcs_in_order() {
-        let html = r#"<img src="https://a/1.png"><p>x</p><img src="https://b/2.jpg" alt="y"><img src="https://a/1.png">"#;
-        assert_eq!(
-            image_srcs(html),
-            vec!["https://a/1.png".to_string(), "https://b/2.jpg".to_string()]
-        );
-    }
-
-    #[test]
-    fn ignores_html_without_images() {
-        assert!(image_srcs("<p>no pictures here</p>").is_empty());
-    }
-
-    #[test]
-    fn transcode_shrinks_a_big_png_to_a_bounded_jpeg() {
-        // A 2000×2000 image is over the pixel cap; the result must be a JPEG
-        // (FF D8 FF) under the byte budget.
-        let big = image::RgbImage::from_fn(2000, 2000, |x, y| {
-            image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
-        });
-        let mut buf = Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(big)
-            .write_to(&mut buf, image::ImageFormat::Png)
-            .unwrap();
-        let out = transcode(&buf.into_inner()).expect("should transcode");
-        assert_eq!(&out[..3], &[0xFF, 0xD8, 0xFF], "not a jpeg");
-        assert!(out.len() <= MAX_IMG_BYTES, "over budget: {}", out.len());
-    }
-
-    #[test]
-    fn transcode_rejects_non_images() {
-        assert!(transcode(b"this is not an image").is_none());
-    }
 
     #[test]
     fn cover_plate_is_a_jpeg_when_no_image() {

@@ -451,11 +451,37 @@ async fn article_mobi(State(st): State<AppState>, Path(id): Path<i64>) -> ApiRes
     let bytes = mobi::build(
         std::slice::from_ref(&article),
         &article.title,
+        &st.pool,
         &st.fetch,
         &mobi::no_progress,
     )
     .await?;
     Ok(mobi_response(bytes, &name))
+}
+
+/// Serve a captured image by its content hash. Outside the token layer: these
+/// are transcoded copies of already-public blog images, and the hash is an
+/// unguessable capability, so gating them would only break the `<img>` tags the
+/// SPA renders (the browser sends no token) for no security gain.
+async fn serve_image(State(st): State<AppState>, Path(hash): Path<String>) -> Response {
+    if !crate::images::is_hash(&hash) {
+        return (StatusCode::BAD_REQUEST, "bad image id").into_response();
+    }
+    match crate::images::read(&st.pool, &hash).await {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "image/jpeg".to_string()),
+                // Content-addressed: the bytes behind a hash never change.
+                (
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no such image").into_response(),
+    }
 }
 
 /// How many of each site's most-recent articles a whole-list export includes.
@@ -586,6 +612,10 @@ pub fn router(state: AppState, cfg: &Config) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         // Outside the token layer on purpose: it is how the SPA learns it needs one.
         .route("/api/auth", get(auth_status))
+        // Also outside: captured images, referenced by the reader's <img> tags
+        // where the browser sends no token. Public content behind an unguessable
+        // hash. See `serve_image`.
+        .route("/img/{hash}", get(serve_image))
         .nest("/api", api)
         .fallback_service(spa)
         .layer(TraceLayer::new_for_http())

@@ -5,6 +5,7 @@ mod crawl;
 mod db;
 mod export;
 mod fetcher;
+mod images;
 mod mobi;
 mod ncx;
 mod urlx;
@@ -95,6 +96,10 @@ async fn main() -> Result<()> {
 
     let crawler = Arc::new(crawl::Crawler::new(pool.clone(), fetch.clone(), cfg.crawl_delay));
     crawl::schedule(crawler.clone(), cfg.scheduler_tick);
+
+    // Migrate images for articles crawled before capture existed. Background and
+    // unhurried; new crawls capture inline, so this only catches up the backlog.
+    images::spawn_backfill(pool.clone(), fetch.clone());
 
     let state = api::AppState {
         pool,

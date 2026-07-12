@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub type Pool = r2d2::Pool<SqliteConnectionManager>;
@@ -54,6 +55,23 @@ const MIGRATIONS: &[&str] = &[r#"
         error       TEXT
     );
     CREATE INDEX idx_crawls_site ON crawls(site_id, started_at DESC);
+    "#,
+    r#"
+    -- Captured images, content-addressed by the hash of their transcoded bytes,
+    -- so identical images across posts collapse to one row.
+    CREATE TABLE images (
+        hash       TEXT    PRIMARY KEY,
+        bytes      BLOB    NOT NULL,
+        byte_len   INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+
+    -- Which stored image a given remote source URL maps to, so a re-crawl or the
+    -- backfill can skip re-fetching an image we already have.
+    CREATE TABLE image_urls (
+        url  TEXT PRIMARY KEY,
+        hash TEXT NOT NULL
+    );
     "#];
 
 pub fn now() -> i64 {
@@ -569,6 +587,90 @@ pub fn delete_article(conn: &Connection, id: i64) -> Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// Images (content-addressed)
+// ---------------------------------------------------------------------------
+
+/// For each source URL we've already captured, its stored image hash. Lets a
+/// crawl or the backfill skip re-fetching images it has seen before.
+pub fn image_hashes_for_urls(conn: &Connection, urls: &[String]) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT hash FROM image_urls WHERE url = ?1")?;
+    let mut out = HashMap::new();
+    for u in urls {
+        if let Some(h) = stmt.query_row([u], |r| r.get::<_, String>(0)).optional()? {
+            out.insert(u.clone(), h);
+        }
+    }
+    Ok(out)
+}
+
+/// Store transcoded images and memo their source URLs together, so a memo hit
+/// always has its blob. Each tuple is `(source_url, hash, jpeg_bytes)`; a hash
+/// we already hold is left as-is (`INSERT OR IGNORE`).
+pub fn store_images(conn: &Connection, items: &[(String, String, Vec<u8>)]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut img = tx.prepare(
+            "INSERT OR IGNORE INTO images (hash, bytes, byte_len, created_at) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let mut memo = tx.prepare("INSERT OR REPLACE INTO image_urls (url, hash) VALUES (?1, ?2)")?;
+        for (url, hash, bytes) in items {
+            img.execute(rusqlite::params![hash, bytes, bytes.len() as i64, now()])?;
+            memo.execute(rusqlite::params![url, hash])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The bytes of one captured image, by hash.
+pub fn image_bytes(conn: &Connection, hash: &str) -> Result<Option<Vec<u8>>> {
+    Ok(conn
+        .query_row("SELECT bytes FROM images WHERE hash = ?1", [hash], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// Bytes for several hashes at once — an export chapter loads all of its images
+/// in one round trip. Hashes we don't have are simply absent from the map.
+pub fn image_bytes_many(conn: &Connection, hashes: &[String]) -> Result<HashMap<String, Vec<u8>>> {
+    let mut stmt = conn.prepare("SELECT bytes FROM images WHERE hash = ?1")?;
+    let mut out = HashMap::new();
+    for h in hashes {
+        if let Some(b) = stmt.query_row([h], |r| r.get::<_, Vec<u8>>(0)).optional()? {
+            out.insert(h.clone(), b);
+        }
+    }
+    Ok(out)
+}
+
+/// `(id, url)` for every article whose stored HTML still points at a remote
+/// image — the backfill worklist. The URL is the referer image hosts want.
+pub fn articles_with_remote_images(conn: &Connection) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT id, url FROM articles WHERE content_html LIKE '%src="http%' ORDER BY id DESC"#,
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn article_content(conn: &Connection, id: i64) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT content_html FROM articles WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+pub fn update_article_html(conn: &Connection, id: i64, html: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE articles SET content_html = ?1 WHERE id = ?2",
+        rusqlite::params![html, id],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Crawls
 // ---------------------------------------------------------------------------
 
@@ -953,6 +1055,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(get_site(&c, s).unwrap().unwrap().feed_url, None);
+    }
+
+    #[test]
+    fn images_are_stored_and_fetched_by_hash() {
+        let c = mem();
+        let items = vec![
+            ("https://a/x.png".to_string(), "deadbeef".to_string(), vec![1u8, 2, 3]),
+            ("https://a/y.png".to_string(), "cafe".to_string(), vec![4u8, 5]),
+        ];
+        store_images(&c, &items).unwrap();
+
+        assert_eq!(image_bytes(&c, "deadbeef").unwrap().unwrap(), vec![1, 2, 3]);
+        assert!(image_bytes(&c, "nope").unwrap().is_none());
+
+        let many =
+            image_bytes_many(&c, &["deadbeef".into(), "cafe".into(), "nope".into()]).unwrap();
+        assert_eq!(many.len(), 2, "missing hashes are just absent");
+        assert_eq!(many["cafe"], vec![4, 5]);
+
+        let memo =
+            image_hashes_for_urls(&c, &["https://a/x.png".into(), "https://a/z.png".into()])
+                .unwrap();
+        assert_eq!(memo.get("https://a/x.png").map(String::as_str), Some("deadbeef"));
+        assert!(!memo.contains_key("https://a/z.png"), "unseen url has no memo");
+
+        // Re-storing the same hash is a no-op, not an error.
+        store_images(&c, &items).unwrap();
+        assert_eq!(stats(&c).unwrap().articles, 0);
+    }
+
+    #[test]
+    fn backfill_lists_only_articles_with_remote_images() {
+        let c = mem();
+        let s = seed_site(&c, "a");
+        // seed_article stores "<p>hi</p>" — no image.
+        seed_article(&c, s, "k1", None);
+        insert_article(
+            &c,
+            &NewArticle {
+                site_id: s,
+                url: "https://x.test/k2".into(),
+                url_key: "k2".into(),
+                title: "t".into(),
+                byline: None,
+                excerpt: None,
+                content_html: r#"<p><img src="https://img/1.png"></p>"#.into(),
+                word_count: 1,
+                published_at: None,
+            },
+        )
+        .unwrap();
+
+        let work = articles_with_remote_images(&c).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].1, "https://x.test/k2");
+
+        update_article_html(&c, work[0].0, r#"<p><img src="/img/abc123"></p>"#).unwrap();
+        assert!(
+            articles_with_remote_images(&c).unwrap().is_empty(),
+            "a captured article drops off the worklist"
+        );
     }
 
     #[test]

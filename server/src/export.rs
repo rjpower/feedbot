@@ -264,5 +264,5 @@ async fn run(
         let job = job.clone();
         move |p| job.report(p)
     };
-    mobi::build(&articles, title, fetch, &sink).await
+    mobi::build(&articles, title, pool, fetch, &sink).await
 }
