@@ -7,17 +7,15 @@ Post-deploy check against a running feedbot.
 Read-only apart from a star toggle it undoes. Asserts the things that have
 actually broken before: articles carry titles and dates, the list never leaks
 `content_html`, the same article is never stored twice, article HTML is
-sanitized, and an exported EPUB is a zip of well-formed XHTML.
+sanitized, and an exported MOBI is a well-formed Mobipocket book.
 """
 import os
 import re
 import sys
 import json
-import zipfile
-import io
+import struct
 import urllib.error
 import urllib.request
-import xml.dom.minidom
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000").rstrip("/")
 TOKEN = os.environ.get("FEEDBOT_TOKEN", "")
@@ -101,19 +99,15 @@ check("star flipped", call(f"/api/articles/{aid}?state=all")["starred"] is (not 
 call(f"/api/articles/{aid}/star", "POST", {"starred": was})
 check("star restored", call(f"/api/articles/{aid}?state=all")["starred"] is was)
 
-print("\n=== epub")
-blob = call("/api/export/epub?state=all&limit=5", raw=True)
-check("epub is a zip", blob[:2] == b"PK", f"{len(blob)} bytes")
-z = zipfile.ZipFile(io.BytesIO(blob))
-check("mimetype is right", z.read("mimetype") == b"application/epub+zip")
-bad = []
-xmls = [n for n in z.namelist() if n.endswith((".xhtml", ".opf", ".ncx", ".xml"))]
-for n in xmls:
-    try:
-        xml.dom.minidom.parseString(z.read(n))
-    except Exception as e:
-        bad.append(f"{n}: {e}")
-check(f"all {len(xmls)} xml parts are well-formed", not bad, "; ".join(bad))
+print("\n=== mobi")
+# A single article, so the check stays quick — the export fetches every image
+# through the sidecar, which the whole-list export multiplies by every post.
+blob = call(f"/api/articles/{arts[0]['id']}/mobi", raw=True)
+# A Mobipocket file is a PalmDB whose type/creator at offset 60 is "BOOKMOBI".
+check("mobi is a palmdb book", blob[60:68] == b"BOOKMOBI", f"{len(blob)} bytes, got {blob[60:68]!r}")
+# The MOBI header magic sits at the start of the first record.
+rec0 = struct.unpack(">I", blob[78:82])[0]
+check("has a MOBI header", blob[rec0 + 16:rec0 + 20] == b"MOBI", f"got {blob[rec0 + 16:rec0 + 20]!r}")
 
 print("\n=== crawls")
 crawls = call("/api/crawls")

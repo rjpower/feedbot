@@ -463,6 +463,49 @@ pub fn list_articles(conn: &Connection, q: &ArticleQuery) -> Result<Vec<Article>
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Up to `per_site` most-recent articles from each site (optionally just one),
+/// newest overall first. The export uses this instead of a flat `LIMIT` so a
+/// prolific blog can't fill the whole book and shut the quiet ones out — every
+/// site with matching articles gets represented. Summaries only; the caller
+/// loads content per id, as with `list_articles`.
+pub fn list_articles_per_site(
+    conn: &Connection,
+    state: &str,
+    site_id: Option<i64>,
+    per_site: i64,
+) -> Result<Vec<Article>> {
+    let mut where_sql = String::from("WHERE 1=1");
+    let mut vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    match state {
+        "unread" => where_sql.push_str(" AND a.read_at IS NULL"),
+        "starred" => where_sql.push_str(" AND a.starred = 1"),
+        _ => {}
+    }
+    if let Some(sid) = site_id {
+        vals.push(Box::new(sid));
+        where_sql.push_str(&format!(" AND a.site_id = ?{}", vals.len()));
+    }
+    vals.push(Box::new(per_site.clamp(1, 100)));
+    let pi = vals.len();
+
+    // ROW_NUMBER partitions by site, so each site is ranked against itself and
+    // contributes its own newest `per_site`, independent of the global order.
+    let sql = format!(
+        "SELECT {ARTICLE_COLS} FROM (
+            SELECT a.*, ROW_NUMBER() OVER (
+                PARTITION BY a.site_id
+                ORDER BY COALESCE(a.published_at, a.fetched_at) DESC, a.id DESC
+            ) AS rn
+            FROM articles a {where_sql}
+         ) a JOIN sites s ON s.id = a.site_id
+         WHERE a.rn <= ?{pi} {ARTICLE_ORDER}"
+    );
+    let refs: Vec<&dyn rusqlite::ToSql> = vals.iter().map(|b| b.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(refs.as_slice(), |r| article_from_row(r, false))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn get_article(conn: &Connection, id: i64) -> Result<Option<Article>> {
     let sql = format!(
         "SELECT {ARTICLE_COLS}, a.content_html FROM articles a
@@ -679,6 +722,34 @@ mod tests {
             "second insert should be a no-op"
         );
         assert_eq!(stats(&c).unwrap().articles, 1);
+    }
+
+    #[test]
+    fn per_site_export_caps_each_site_and_includes_the_quiet_ones() {
+        let c = mem();
+        let busy = seed_site(&c, "busy");
+        let quiet = seed_site(&c, "quiet");
+        // A prolific blog and a sleepy one. A flat top-N by recency would return
+        // only the busy site; per-site must surface both.
+        for i in 0..8 {
+            seed_article(&c, busy, &format!("b{i}"), Some(2000 + i));
+        }
+        seed_article(&c, quiet, "q0", Some(1000));
+
+        let got = list_articles_per_site(&c, "all", None, 3).unwrap();
+        let from_busy = got.iter().filter(|a| a.site_id == busy).count();
+        let from_quiet = got.iter().filter(|a| a.site_id == quiet).count();
+        assert_eq!(from_busy, 3, "busy site should be capped at per_site");
+        assert_eq!(from_quiet, 1, "quiet site must still be represented");
+
+        // The cap keeps each site's *newest*, and the result is newest-first.
+        let busy_keys: Vec<_> = got.iter().filter(|a| a.site_id == busy).map(|a| a.url.clone()).collect();
+        assert!(busy_keys.iter().all(|u| u.ends_with("b7") || u.ends_with("b6") || u.ends_with("b5")));
+
+        // A site filter narrows to one site, still capped.
+        let only_busy = list_articles_per_site(&c, "all", Some(busy), 2).unwrap();
+        assert_eq!(only_busy.len(), 2);
+        assert!(only_busy.iter().all(|a| a.site_id == busy));
     }
 
     #[test]

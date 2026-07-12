@@ -116,7 +116,6 @@ watch(() => route.params.id, (id) => id && load(id));
           {{ article.starred ? "★" : "☆" }}
         </button>
         <a class="btn btn--bare" :href="downloadUrl(`/articles/${article.id}/mobi`)" title="Download for Kindle (.mobi, images embedded)">↓ MOBI</a>
-        <a class="btn btn--bare" :href="downloadUrl(`/articles/${article.id}/epub`)" title="Download EPUB">↓ EPUB</a>
       </div>
     </nav>
 

@@ -9,7 +9,6 @@ anyhow = "1.0.103"
 axum = "0.8.9"
 base64 = "0.22.1"
 chrono = "0.4.45"
-epub-builder = "0.8.3"
 # MOBI writer for the Kindle's browser, which takes a .mobi download but chokes
 # on our Vue SPA. Default features only: the image/cover crates stay off (we
 # supply cover bytes and do our own resizing with the `image` crate below).

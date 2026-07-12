@@ -101,13 +101,13 @@ async function markAllRead() {
   await load();
 }
 
-const exportQuery = computed(() => {
-  const q = new URLSearchParams({ state: state.value, limit: "50" });
+// The export takes up to per_site of each site's newest, not a flat cut, so
+// every site lands in the book instead of the most prolific few.
+const mobiHref = computed(() => {
+  const q = new URLSearchParams({ state: state.value, per_site: "10" });
   if (siteId.value) q.set("site_id", String(siteId.value));
-  return q.toString();
+  return downloadUrl(`/export/mobi?${q}`);
 });
-const exportHref = computed(() => downloadUrl(`/export/epub?${exportQuery.value}`));
-const mobiHref = computed(() => downloadUrl(`/export/mobi?${exportQuery.value}`));
 
 const emptyMessage = computed(() => {
   if (route.query.q) return `Nothing matches “${route.query.q}”.`;
@@ -148,8 +148,7 @@ const emptyMessage = computed(() => {
     </div>
 
     <div v-if="articles.length" class="actions">
-      <a class="btn btn--bare" :href="mobiHref" title="Download this list for Kindle (.mobi, images embedded)">↓ MOBI</a>
-      <a class="btn btn--bare" :href="exportHref" title="Download this list as EPUB">↓ EPUB</a>
+      <a class="btn btn--bare" :href="mobiHref" title="Download for Kindle: up to 10 newest per site, images embedded">↓ MOBI</a>
       <button class="btn btn--bare" @click="markAllRead">Mark all read</button>
     </div>
 

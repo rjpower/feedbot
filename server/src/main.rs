@@ -3,7 +3,6 @@
 mod api;
 mod crawl;
 mod db;
-mod epub;
 mod fetcher;
 mod mobi;
 mod urlx;

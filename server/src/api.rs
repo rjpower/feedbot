@@ -2,7 +2,7 @@
 
 use crate::crawl::{CrawlOutcome, Crawler};
 use crate::db::{self, ArticleQuery, NewSite, Pool, SitePatch};
-use crate::{Config, epub, mobi};
+use crate::{Config, mobi};
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
@@ -76,7 +76,7 @@ fn token_from(req: &Request) -> Option<String> {
     {
         return Some(v.to_string());
     }
-    // Query param, so an e-reader can pull an .epub with a plain URL.
+    // Query param, so an e-reader can pull a .mobi with a plain URL.
     let q = req.uri().query()?;
     form_urlencoded::parse(q.as_bytes())
         .find(|(k, _)| k == "token")
@@ -421,62 +421,6 @@ async fn mark_all_read(
 }
 
 // ---------------------------------------------------------------------------
-// EPUB
-// ---------------------------------------------------------------------------
-
-fn epub_response(bytes: Vec<u8>, filename: &str) -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "application/epub+zip".to_string()),
-            (
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{filename}.epub\""),
-            ),
-        ],
-        bytes,
-    )
-        .into_response()
-}
-
-async fn article_epub(State(st): State<AppState>, Path(id): Path<i64>) -> ApiResult<Response> {
-    let article = db::call(&st.pool, move |c| db::get_article(c, id))
-        .await?
-        .ok_or_else(|| ApiError::not_found("no such article"))?;
-    let name = epub::safe_filename(&article.title);
-    let bytes = epub::build(std::slice::from_ref(&article), &article.title)?;
-    Ok(epub_response(bytes, &name))
-}
-
-/// Bundle a whole reading list into one book — the point of the exercise.
-async fn export_epub(
-    State(st): State<AppState>,
-    Query(q): Query<ArticleQuery>,
-) -> ApiResult<Response> {
-    let label = q.state.clone().unwrap_or_else(|| "unread".into());
-    let articles = db::call(&st.pool, move |c| {
-        let summaries = db::list_articles(c, &q)?;
-        summaries
-            .iter()
-            .map(|s| {
-                db::get_article(c, s.id)?
-                    .ok_or_else(|| anyhow::anyhow!("article {} vanished mid-export", s.id))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-    })
-    .await?;
-
-    if articles.is_empty() {
-        return Err(ApiError::bad("no articles match that filter"));
-    }
-    let title = format!("feedbot — {label}");
-    let bytes = epub::build(&articles, &title)?;
-    Ok(epub_response(
-        bytes,
-        &format!("feedbot-{}", epub::safe_filename(&label)),
-    ))
-}
-
-// ---------------------------------------------------------------------------
 // MOBI
 // ---------------------------------------------------------------------------
 
@@ -499,20 +443,39 @@ async fn article_mobi(State(st): State<AppState>, Path(id): Path<i64>) -> ApiRes
     let article = db::call(&st.pool, move |c| db::get_article(c, id))
         .await?
         .ok_or_else(|| ApiError::not_found("no such article"))?;
-    let name = epub::safe_filename(&article.title);
+    let name = mobi::safe_filename(&article.title);
     let bytes = mobi::build(std::slice::from_ref(&article), &article.title, &st.fetch).await?;
     Ok(mobi_response(bytes, &name))
 }
 
-/// The same reading list as the EPUB export, but as a Kindle-native `.mobi`
-/// with every article image embedded rather than left as a dead remote link.
+/// How many of each site's most-recent articles a whole-list export includes.
+/// Per-site rather than a global cut so a prolific blog can't crowd the quiet
+/// ones out of the book — every site with matching articles is represented.
+const DEFAULT_PER_SITE: i64 = 10;
+
+#[derive(Deserialize)]
+pub struct ExportQuery {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    site_id: Option<i64>,
+    #[serde(default)]
+    per_site: Option<i64>,
+}
+
+/// A reading list as a Kindle-native `.mobi`: one section per site, each site's
+/// most-recent posts nested beneath it, with every image embedded rather than
+/// left as a dead remote link.
 async fn export_mobi(
     State(st): State<AppState>,
-    Query(q): Query<ArticleQuery>,
+    Query(q): Query<ExportQuery>,
 ) -> ApiResult<Response> {
     let label = q.state.clone().unwrap_or_else(|| "unread".into());
+    let per_site = q.per_site.unwrap_or(DEFAULT_PER_SITE);
+    let site_id = q.site_id;
+    let state = label.clone();
     let articles = db::call(&st.pool, move |c| {
-        let summaries = db::list_articles(c, &q)?;
+        let summaries = db::list_articles_per_site(c, &state, site_id, per_site)?;
         summaries
             .iter()
             .map(|s| {
@@ -530,7 +493,7 @@ async fn export_mobi(
     let bytes = mobi::build(&articles, &title, &st.fetch).await?;
     Ok(mobi_response(
         bytes,
-        &format!("feedbot-{}", epub::safe_filename(&label)),
+        &format!("feedbot-{}", mobi::safe_filename(&label)),
     ))
 }
 
@@ -571,9 +534,7 @@ pub fn router(state: AppState, cfg: &Config) -> Router {
         .route("/articles/{id}", delete(remove_article))
         .route("/articles/{id}/read", post(set_read))
         .route("/articles/{id}/star", post(set_starred))
-        .route("/articles/{id}/epub", get(article_epub))
         .route("/articles/{id}/mobi", get(article_mobi))
-        .route("/export/epub", get(export_epub))
         .route("/export/mobi", get(export_mobi))
         // Without this, an unknown /api path falls through to the SPA and a
         // typo'd endpoint answers with a page of HTML.

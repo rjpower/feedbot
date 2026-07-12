@@ -1,15 +1,16 @@
 //! MOBI export.
 //!
 //! The reading device is a Kindle, whose browser takes a `.mobi` download but
-//! can't run feedbot's SPA. EPUB would do on paper, but Amazon dropped MOBI from
-//! Send-to-Kindle and a sideloaded `.mobi` is the format its browser actually
-//! opens. Unlike the EPUB path, this one **embeds images**: the stored HTML
-//! keeps remote `<img src>` URLs, which render as nothing on an offline reader,
-//! so we fetch each one through the sidecar (the single network chokepoint) and
-//! staple the bytes in as MOBI image records.
+//! can't run feedbot's SPA. Amazon dropped MOBI from Send-to-Kindle, but a
+//! sideloaded `.mobi` is the format its browser actually opens, so this is how
+//! an article leaves the screen and lands on the device.
+//!
+//! It **embeds images**: the stored HTML keeps remote `<img src>` URLs, which
+//! render as nothing on an offline reader, so we fetch each one through the
+//! sidecar (the single network chokepoint) and staple the bytes in as MOBI
+//! image records.
 
 use crate::db::Article;
-use crate::epub::{escape, to_xhtml};
 use crate::fetcher::Fetcher;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -17,6 +18,53 @@ use iepub::prelude::{MobiBuilder, MobiHtml, MobiNav};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::LazyLock;
+
+// ---------------------------------------------------------------------------
+// XHTML helpers
+// ---------------------------------------------------------------------------
+
+/// MOBI's chapter markup is XML-ish, but Ammonia (which sanitizes the stored
+/// HTML) emits HTML5 with unclosed void tags — `<br>`, not `<br/>`.
+static VOID_TAG: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)<(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)\b([^>]*?)\s*/?>",
+    )
+    .unwrap()
+});
+
+/// Close the void elements Ammonia leaves open, and spell U+00A0 numerically:
+/// XHTML defines only `amp/lt/gt/quot/apos`, and a reader's XML parser rejects a
+/// whole chapter over one `&nbsp;`.
+fn to_xhtml(html: &str) -> String {
+    VOID_TAG
+        .replace_all(html, "<$1$2/>")
+        .replace("&nbsp;", "&#160;")
+}
+
+fn escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// A filename an e-reader won't choke on.
+pub fn safe_filename(title: &str) -> String {
+    let slug: String = title
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug = slug.chars().take(60).collect::<String>();
+    if slug.is_empty() {
+        "article".into()
+    } else {
+        slug
+    }
+}
 
 /// Kindle e-ink panels top out around 1264×1680. Anything larger is detail the
 /// device can't show, and bytes MOBI's per-image record can't afford.
@@ -78,7 +126,7 @@ struct Chapter {
     assets: Vec<(String, Vec<u8>)>,
 }
 
-/// Byline · date · site, matching the EPUB's chapter header.
+/// Byline · date · site, shown under each post's heading.
 fn meta_line(a: &Article) -> String {
     let mut parts = Vec::new();
     if let Some(b) = &a.byline {
@@ -371,5 +419,34 @@ mod tests {
     fn grouping_a_single_site_is_one_group() {
         let arts = [at_site(7), at_site(7)];
         assert_eq!(group_by_site(&arts), vec![(7, vec![0, 1])]);
+    }
+
+    #[test]
+    fn void_elements_are_closed_for_xhtml() {
+        let x = to_xhtml(r#"<p>a<br>b</p><img src="u.png" alt="x"><hr>"#);
+        assert_eq!(x, r#"<p>a<br/>b</p><img src="u.png" alt="x"/><hr/>"#);
+    }
+
+    #[test]
+    fn already_closed_tags_are_left_alone() {
+        assert_eq!(to_xhtml("<br/>"), "<br/>");
+        assert_eq!(to_xhtml("<br />"), "<br/>");
+    }
+
+    #[test]
+    fn nbsp_becomes_numeric_but_xml_entities_survive() {
+        assert_eq!(to_xhtml("<p>a&nbsp;b</p>"), "<p>a&#160;b</p>");
+        assert_eq!(to_xhtml("<p>a &amp; b &lt;c&gt;</p>"), "<p>a &amp; b &lt;c&gt;</p>");
+    }
+
+    #[test]
+    fn escapes_the_five_xml_metacharacters() {
+        assert_eq!(escape(r#"Tom & "Jerry" <b>"#), "Tom &amp; &quot;Jerry&quot; &lt;b&gt;");
+    }
+
+    #[test]
+    fn filenames_are_slugified() {
+        assert_eq!(safe_filename("Al-Qadim: Master of None!"), "Al-Qadim-Master-of-None");
+        assert_eq!(safe_filename("   "), "article");
     }
 }
